@@ -1,10 +1,10 @@
 # entsoe-ext
 
-Opt-in fixes and explicit wrappers around **[entsoe-py](https://github.com/EnergieID/entsoe-py) 0.8.0**.
+Opt-in fixes and explicit wrappers around **[entsoe-py](https://github.com/EnergieID/entsoe-py) 0.8.0 / 0.8.1**.
 
 `entsoe-ext` is a thin, dependency-light layer that sits *on top of* the installed
 `entsoe-py` package (it does **not** vendor or replace it). It addresses a small set
-of "uncertain / TODO" spots in 0.8.0 and provides a **single client entry point** so
+of "uncertain / TODO" spots in 0.8.x and provides a **single client entry point** so
 that callers cannot accidentally bypass the corrections.
 
 > Scope note — this package is deliberately **opt-in and minimal**. It fixes only what
@@ -21,6 +21,7 @@ that callers cannot accidentally bypass the corrections.
 | 4 | `parse_netpositions` implements `factor * series.abs()` to assign a sign per `TimeSeries` | **Not a bug** → verified against raw A25 XML: `<quantity>` is always a magnitude and the direction is fully encoded by `in_Domain`/`out_Domain`; the library logic matches. `parse_a25()` re-implements it *explicitly* (same output) and never rewrites the sign |
 | 5 | `query_offered_capacity` timezone docstring *"--> to check"* | **No change** — the library already performs `tz_convert` |
 | 6 | `@year_limited` decorator comment *"Assumes blocks are sorted"* | **Mitigated** → `dedupe_by_index()` to guarantee a unique, sorted index after merging chunks |
+| 7 | `EntsoeRawClient` methods carry no `limited` decorator, so long windows are never split by the library; 0.8.1's PandasClient `@month_limited` does not apply to raw fetches | **Handled** → `query_net_position_corrected()` caps windows at the measured platform limit (**365 d**) itself: ≤1 year stays a single request, longer windows are split block by block with every block's first instant kept |
 
 If you only care about the genuine general-purpose fixes, #1 and #2 are the ones worth
 upstreaming to `entsoe-py` itself.
@@ -33,7 +34,7 @@ pip install entsoe-ext            # from PyPI (once published)
 pip install "git+https://github.com/luishee/entsoe-ext.git"
 ```
 
-Requires `entsoe-py==0.8.0` (pinned; see *Compatibility* below). Set your API key:
+Requires `entsoe-py>=0.8.0,<0.8.2` (see *Compatibility* below). Set your API key:
 
 ```bash
 export ENTSOE_API_KEY="your-token"   # PowerShell: $env:ENTSOE_API_KEY="..."
@@ -101,6 +102,18 @@ series = query_net_position_corrected(
 differences are the explicit domain-direction parsing and the `mean` (instead of
 `first`) hourly aggregation before the SDAC go-live.
 
+**Window handling (0.2.0)**: `query_net_position_corrected()` fetches raw XML via
+`EntsoeRawClient`, which carries no `limited` decorator — the library never splits
+the window for you. Measured against the live A25 endpoint (binary search,
+2026-10-18), the platform's window cap is **365 days** (366 days → HTTP 400). The
+function therefore caps windows at 365 days itself:
+
+* windows up to one year → a **single** request (identical to entsoe-py 0.8.0 behaviour, no extra quota);
+* longer windows → fetched block by block (≤365 d, left-closed/right-open), merged
+  with `dedupe_by_index`, and the **first instant of every block is kept** (the
+  0.8.0 `@year_limited` left-open truncation, which silently dropped it, is not
+  replicated). `NoMatchingDataError` is raised only when *every* block is empty.
+
 ## Compatibility
 
 `entsoe-ext` wraps a couple of **private** helpers of `entsoe-py`
@@ -111,10 +124,13 @@ package — the upstream fixes may already be present, in which case the wrapper
 dropped.
 
 > 0.8.1 note: 0.8.1 only swaps several endpoint decorators from `@year_limited` to the
-> new `@month_limited` (an ENTSO-E platform-side change: single queries on those
-> endpoints are now limited to ≤ 1 month). The files that this package patches or
-> reuses (`parsers.py`, `series_parsers.py`) are **byte-identical** between 0.8.0 and
-> 0.8.1, and neither patched defect is fixed upstream, so the patches apply unchanged.
+> new `@month_limited` (its release notes cite an ENTSO-E platform-side change) and
+> rewrites `month_blocks`. Empirically the platform does **not** (yet) enforce a
+> one-month cap on A25 — the measured limit is 365 days — so `@month_limited` is a
+> defensive tightening; this package keeps the wider, measured 365-day cap and only
+> splits when a window exceeds it. The files that this package patches or reuses
+> (`parsers.py`, `series_parsers.py`) are **byte-identical** between 0.8.0 and 0.8.1,
+> and neither patched defect is fixed upstream, so the patches apply unchanged.
 
 ## Tests
 
