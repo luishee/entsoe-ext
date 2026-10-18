@@ -15,7 +15,7 @@ Patched:
   (the docstring says mean; 0.8.0 actually used ``first``).
 
 Opt out with the environment variable ``ENTSOE_EXT_PATCH=0``; if the installed
-``entsoe-py`` version differs from the validated one, ``install()`` is a no-op
+``entsoe-py`` version differs from the validated ones, ``install()`` is a no-op
 (unless ``force=True``).
 """
 import logging
@@ -25,7 +25,15 @@ from entsoe_ext.series_ext import resolution_to_timedelta_ext, to_hourly_mean
 
 logger = logging.getLogger("entsoe_ext")
 
-_EXPECTED_VERSION = "0.8.0"
+# Versions validated against the patched internals:
+# * 0.8.0 — the version this package was developed against;
+# * 0.8.1 — verified byte-identical on the patched surface (``parsers.py`` /
+#   ``series_parsers.py`` unchanged; ``entsoe.py`` only swaps several decorators
+#   from ``@year_limited`` to the new ``@month_limited`` in response to an
+#   ENTSO-E platform-side API change; neither of the patched defects — the
+#   ``per_hour`` ``first``-vs-mean gap and the hard-coded resolutions — is
+#   fixed upstream, so the patches remain necessary).
+_EXPECTED_VERSIONS = ("0.8.0", "0.8.1")
 
 
 def _patch_allborders(EntsoePandasClient):
@@ -48,18 +56,18 @@ def _patch_allborders(EntsoePandasClient):
 def install(force=False):
     """Install the library patches (idempotent). Returns True if installed/already latest.
 
-    Version guard: patches are only applied when ``entsoe.__version__ == 0.8.0``
-    (other versions may have changed behaviour — skipped to avoid surprises); setting
-    ``ENTSOE_EXT_PATCH=0`` skips entirely.
+    Version guard: patches are only applied when ``entsoe.__version__`` is one of
+    ``_EXPECTED_VERSIONS`` (other versions may have changed behaviour — skipped to
+    avoid surprises); setting ``ENTSOE_EXT_PATCH=0`` skips entirely.
     """
     if os.getenv("ENTSOE_EXT_PATCH", "1") == "0":
         logger.info("[entsoe_ext] ENTSOE_EXT_PATCH=0, skipping library patches")
         return False
     import entsoe
     ver = getattr(entsoe, "__version__", None)
-    if ver != _EXPECTED_VERSION and not force:
+    if ver not in _EXPECTED_VERSIONS and not force:
         logger.warning(
-            f"[entsoe_ext] entsoe-py version {ver!r} != {_EXPECTED_VERSION}, "
+            f"[entsoe_ext] entsoe-py version {ver!r} not in {_EXPECTED_VERSIONS}, "
             f"skipping library patches (force with install(force=True))")
         return False
     import entsoe.parsers as P

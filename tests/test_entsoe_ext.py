@@ -174,14 +174,113 @@ class TestMiscHelpers(unittest.TestCase):
         self.assertAlmostEqual(float(out.iloc[0]["v"]), 2.0)
 
 
+class TestQueryNetPositionCorrectedWindowSplit(unittest.TestCase):
+    """Window splitting of ``query_net_position_corrected`` (measured platform cap 365 d).
+
+    RawClient carries no ``limited`` decorator → the function splits at 365 days
+    itself. A fake client records every ``(start, end)`` call, verifying:
+    - windows up to one year stay a single call (identical to 0.8.0 behaviour);
+    - longer windows are split into ≤365-day left-closed/right-open blocks whose
+      boundaries chain (each block's end == next block's start);
+    - the first instant of every block is kept (no ``@year_limited`` left-open
+      truncation);
+    - ``NoMatchingDataError`` from some blocks skips them; raised only when all
+      blocks are empty.
+    """
+
+    class _FakeClient:
+        """Stand-in raw client: intercept ``_base_request`` to return canned XML.
+
+        ``EntsoeRawClient.query_net_position(client, ...)`` only depends on
+        ``self._base_request(params, start, end)`` → intercepting there avoids
+        any network access.
+        """
+
+        def __init__(self, data_by_block=None):
+            self.calls = []                     # [(start, end), ...]
+            self.data_by_block = data_by_block or {}
+            self._last = None                   # most recent (start, end)
+
+        class _Resp:
+            def __init__(self, text):
+                self.text = text
+
+        def _base_request(self, params, start, end):
+            from entsoe.exceptions import NoMatchingDataError
+            self.calls.append((start, end))
+            self._last = (start, end)
+            for (bs, be), (vals_start, values) in self.data_by_block.items():
+                if start == bs and end == be:
+                    xml = _doc(_ts_xml(NEIGH_EIC, RO_EIC, vals_start, "PT60M", values))
+                    return self._Resp(xml)
+            raise NoMatchingDataError
+
+    def test_window_within_a_year_single_call(self):
+        # a 3-month window (the ETL batch size) → single call, same as 0.8.0
+        from entsoe_ext import query_net_position_corrected
+        s = pd.Timestamp("2025-06-01", tz="Europe/Bucharest")
+        e = pd.Timestamp("2025-09-01", tz="Europe/Bucharest")
+        client = self._FakeClient(data_by_block={
+            (s, e): ("2025-06-01T00:00Z", [100]),
+        })
+        out = query_net_position_corrected(client, "RO", start=s, end=e)
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual((client.calls[0][0], client.calls[0][1]), (s, e))
+        self.assertEqual(len(out), 1)
+
+    def test_window_over_a_year_split_into_365d_blocks(self):
+        from entsoe_ext import query_net_position_corrected
+        s = pd.Timestamp("2024-01-01", tz="Europe/Bucharest")
+        e = pd.Timestamp("2026-01-01", tz="Europe/Bucharest")   # 731 days → 3 blocks
+        client = self._FakeClient()
+        with self.assertRaises(Exception):
+            query_net_position_corrected(client, "RO", start=s, end=e)
+        self.assertEqual(len(client.calls), 3)
+        self.assertEqual(client.calls[0][0], s)
+        self.assertEqual(client.calls[-1][1], e)
+        for i in range(2):
+            self.assertEqual(client.calls[i][1], client.calls[i + 1][0])
+        # every block spans at most 365 days
+        for bs, be in client.calls:
+            self.assertLessEqual((be - bs).days, 365)
+
+    def test_block_first_instant_not_dropped(self):
+        # both blocks have data → the second block's first instant must survive
+        from entsoe_ext import query_net_position_corrected
+        s = pd.Timestamp("2024-06-01", tz="Europe/Bucharest")
+        b2 = s + pd.Timedelta(days=365)          # block boundary
+        e = pd.Timestamp("2025-09-01", tz="Europe/Bucharest")
+        client = self._FakeClient(data_by_block={
+            (s, b2): ("2024-06-01T00:00Z", [100, 110]),
+            (b2, e): ("2025-05-31T00:00Z", [200, 210]),
+        })
+        out = query_net_position_corrected(client, "RO", start=s, end=e)
+        self.assertEqual(len(client.calls), 2)
+        idx = {t.isoformat() for t in out.index}
+        # second block first instants: 2025-05-31 00:00Z = 03:00 EEST
+        self.assertIn("2025-05-31T03:00:00+03:00", idx)
+        self.assertIn("2025-05-31T04:00:00+03:00", idx)
+        self.assertIn("2024-06-01T03:00:00+03:00", idx)
+
+    def test_all_blocks_empty_raises(self):
+        from entsoe.exceptions import NoMatchingDataError
+        from entsoe_ext import query_net_position_corrected
+        s = pd.Timestamp("2024-01-01", tz="Europe/Bucharest")
+        e = pd.Timestamp("2026-01-01", tz="Europe/Bucharest")
+        client = self._FakeClient()   # every block raises NoMatchingDataError
+        with self.assertRaises(NoMatchingDataError):
+            query_net_position_corrected(client, "RO", start=s, end=e)
+        self.assertEqual(len(client.calls), 3)
+
+
 class TestPatchInstall(unittest.TestCase):
     def test_install_idempotent_and_effective(self):
         import entsoe
         from entsoe_ext.patch import install
         import entsoe.series_parsers as SP
 
-        if getattr(entsoe, "__version__", None) != "0.8.0":
-            self.skipTest(f"entsoe-py version {entsoe.__version__!r} != 0.8.0, "
+        if getattr(entsoe, "__version__", None) not in ("0.8.0", "0.8.1"):
+            self.skipTest(f"entsoe-py version {entsoe.__version__!r} not validated, "
                           f"skipping patch assertions")
         self.assertTrue(install())
         self.assertTrue(getattr(SP, "_ENTS_EXT_PATCHED", False))

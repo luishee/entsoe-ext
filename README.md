@@ -105,10 +105,16 @@ differences are the explicit domain-direction parsing and the `mean` (instead of
 
 `entsoe-ext` wraps a couple of **private** helpers of `entsoe-py`
 (`entsoe.series_parsers._extract_timeseries`, `_parse_timeseries_generic`) and patches
-its internals, so it is validated **only against `entsoe-py==0.8.0`**. `install()` is a
-no-op (with a warning) on any other version. If you upgrade `entsoe-py`, re-check this
+its internals, so it is validated against **`entsoe-py` 0.8.0 and 0.8.1**. `install()` is
+a no-op (with a warning) on any other version. If you upgrade `entsoe-py`, re-check this
 package — the upstream fixes may already be present, in which case the wrappers can be
 dropped.
+
+> 0.8.1 note: 0.8.1 only swaps several endpoint decorators from `@year_limited` to the
+> new `@month_limited` (an ENTSO-E platform-side change: single queries on those
+> endpoints are now limited to ≤ 1 month). The files that this package patches or
+> reuses (`parsers.py`, `series_parsers.py`) are **byte-identical** between 0.8.0 and
+> 0.8.1, and neither patched defect is fixed upstream, so the patches apply unchanged.
 
 ## Tests
 
