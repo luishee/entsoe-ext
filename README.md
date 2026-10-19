@@ -1,30 +1,20 @@
 # entsoe-ext
 
-Opt-in fixes and explicit wrappers around **[entsoe-py](https://github.com/EnergieID/entsoe-py) 0.8.0 / 0.8.1**.
+A **self-contained** client for the [ENTSO-E Transparency Platform](https://transparency.entsoe.eu/).
 
-`entsoe-ext` is a thin, dependency-light layer that sits *on top of* the installed
-`entsoe-py` package (it does **not** vendor or replace it). It addresses a small set
-of "uncertain / TODO" spots in 0.8.x and provides a **single client entry point** so
-that callers cannot accidentally bypass the corrections.
+Since **0.2.0** this package no longer wraps or patches
+[entsoe-py](https://github.com/EnergieID/entsoe-py): it implements its own HTTP
+layer, chunking/pagination, exception hierarchy, area/type mappings and document
+parsers, replicating entsoe-py **0.8.1** semantics value-for-value (validated by
+a three-layer A/B equivalence suite during the migration). `entsoe-py` is **not**
+a runtime dependency.
 
-> Scope note — this package is deliberately **opt-in and minimal**. It fixes only what
-> is demonstrably wrong or ambiguous, and it does not change signals that are already
-> correct. See the table below.
-
-## What it does (and does not)
-
-| # | entsoe-py 0.8.0 spot | Disposition in `entsoe-ext` |
-|---|---|---|
-| 1 | `series_parsers._resolution_to_timedelta` raises `NotImplementedError` on unknown resolutions (hard-coded 8 values, comment: *"Everything is hard coded"*) | **Fixed** → `resolution_to_timedelta_ext()` with a generic ISO-8601 fallback; raises a descriptive `ValueError` instead |
-| 2 | `EntsoePandasClient.query_physical_crossborder_allborders(per_hour=True)` docstring says *"it will then take the mean"* but actually takes `resample('h').first()` | **Fixed** → `per_hour=True` now truly returns the hourly **mean** (via `to_hourly_mean`) |
-| 3 | `query_net_position(dayahead=True)` uses `resample('h').first()` before the SDAC 15-min go-live | **Explicit wrapper** → `resample_sdac_native()` (`mean` before go-live, native resolution after). This is a **convention choice**, not a correctness fix |
-| 4 | `parse_netpositions` implements `factor * series.abs()` to assign a sign per `TimeSeries` | **Not a bug** → verified against raw A25 XML: `<quantity>` is always a magnitude and the direction is fully encoded by `in_Domain`/`out_Domain`; the library logic matches. `parse_a25()` re-implements it *explicitly* (same output) and never rewrites the sign |
-| 5 | `query_offered_capacity` timezone docstring *"--> to check"* | **No change** — the library already performs `tz_convert` |
-| 6 | `@year_limited` decorator comment *"Assumes blocks are sorted"* | **Mitigated** → `dedupe_by_index()` to guarantee a unique, sorted index after merging chunks |
-| 7 | `EntsoeRawClient` methods carry no `limited` decorator, so long windows are never split by the library; 0.8.1's PandasClient `@month_limited` does not apply to raw fetches | **Handled** → `query_net_position_corrected()` caps windows at the measured platform limit (**365 d**) itself: ≤1 year stays a single request, longer windows are split block by block with every block's first instant kept |
-
-If you only care about the genuine general-purpose fixes, #1 and #2 are the ones worth
-upstreaming to `entsoe-py` itself.
+> **Breaking changes in 0.2.0** (upgrading from the 0.1.x wrapper line):
+> `get_client()` now returns the self-built `EntsoeClient` (no more
+> `kind="pandas"/"raw"` two-state client), the `patch` module is gone, and
+> `query_net_position_corrected()` was absorbed into
+> `EntsoeClient.net_position()`. The A25 helpers (`parse_a25`, series helpers)
+> keep working.
 
 ## Install
 
@@ -34,7 +24,8 @@ pip install entsoe-ext            # from PyPI (once published)
 pip install "git+https://github.com/luishee/entsoe-ext.git"
 ```
 
-Requires `entsoe-py>=0.8.0,<0.8.2` (see *Compatibility* below). Set your API key:
+Requires Python >= 3.9; dependencies are `requests`, `beautifulsoup4` and
+`pandas`. Set your API key:
 
 ```bash
 export ENTSOE_API_KEY="your-token"   # PowerShell: $env:ENTSOE_API_KEY="..."
@@ -47,90 +38,110 @@ export ENTSOE_API_KEY="your-token"   # PowerShell: $env:ENTSOE_API_KEY="..."
 ```python
 from entsoe_ext import get_client
 
-client = get_client("pandas")   # or "raw"; api_key=... overrides the env var
+client = get_client()          # api_key=... overrides the env var
 ```
 
-`get_client()` calls `install()` first (see below) and returns a configured
-`EntsoePandasClient` / `EntsoeRawClient`.
-
-### Apply the library patches
+`EntsoeClient` exposes two channels: raw XML methods (`*_xml`) and parsed data
+methods (Series/DataFrame).
 
 ```python
-from entsoe_ext import install
-install()          # idempotent, version-guarded
+s  = client.net_position("RO", start=..., end=...)   # A25 day-ahead net position
+df = client.generation("RO", start=..., end=...)     # A75 per-psr generation
+xml = client.net_position_xml("RO", start, end)      # raw XML (audit / custom parsing)
 ```
 
-Disable entirely with the environment variable `ENTSOE_EXT_PATCH=0`.
+### Data methods
 
-Applied patches:
+| method | document | returns | index timezone |
+|---|---|---|---|
+| `day_ahead_prices(a, s, e)` | A44 | Series | area.tz |
+| `net_position(a, s, e, dayahead=True)` | A25 | Series | area.tz |
+| `load(a, s, e)` / `load_forecast(a, s, e)` | A65 | Series | area.tz |
+| `generation(a, s, e)` | A75 | DataFrame (psr or MultiIndex(psr, metric)) | area.tz |
+| `generation_forecast(a, s, e)` | A71 | Series (always) | area.tz |
+| `wind_solar_forecast(a, s, e)` | A69 | DataFrame (netted) | area.tz |
+| `installed_capacity(a, year)` | A68 | DataFrame | area.tz |
+| `imbalance_prices(a, s, e)` | A85 | DataFrame (Long/Short) | area.tz |
+| `imbalance_volumes(a, s, e)` | A86 | Series | area.tz |
+| `activated_balancing_prices(a, s, e)` | A84 | DataFrame (Price/Direction/ReserveType) | area.tz |
+| `procured_capacity(a, process_type, s, e)` | A81 | **long table** `[timestamp, direction, mrid, price, volume]` | area.tz |
+| `hydro_reservoir_storage(a, s, e)` | A72 | Series | native (not converted) |
+| `crossborder_flows(f, t, s, e)` | A11 | Series | from-area tz |
+| `scheduled_exchanges(f, t, s, e)` | A09 | Series | from-area tz |
+| `ntc_dayahead(f, t, s, e)` | A61 | Series | from-area tz |
+| `offered_capacity(f, t, s, e, contract="A01")` | A31/A25 | Series | from-area tz |
+| `outage_units(a, s, e, kind="generation")` | A80/A77 | DataFrame (19 cols) | area.tz |
+| `outage_transmission(f, t, s, e)` | A78 | DataFrame (14 cols) | from-area tz |
 
-* `entsoe.series_parsers._resolution_to_timedelta` / `entsoe.parsers._resolution_to_timedelta`
-  → `resolution_to_timedelta_ext`
-* `EntsoePandasClient.query_physical_crossborder_allborders` → `per_hour=True` uses the mean
+Raw XML channels exist for every endpoint above (`*_xml` suffix); ZIP endpoints
+additionally expose `*_xml` variants that unzip and join the payloads to a
+string, for auditing.
 
-### Standalone helpers
+### Series helpers and exceptions
 
 ```python
 from entsoe_ext import (
     resolution_to_timedelta_ext,   # "PT45M" -> "45min" (ISO-8601 fallback)
-    resample_sdac_native,          # mean before SDAC go-live, native after
+    resample_sdac_native,          # mean before the SDAC go-live, native after
+    sdac_golive,                   # 2025-10-01 Europe/Amsterdam (local constant)
     to_hourly_mean,                # resample('h').mean()
     dedupe_by_index,               # unique, sorted index after merging chunks
+    NoMatchingDataError, PaginationError, InvalidBusinessParameterError,
+    InvalidPSRTypeError, InvalidParameterError,
 )
 ```
 
-### Net position (A25), explicit parsing
+## Deliberate differences from entsoe-py
 
-```python
-from entsoe_ext import get_client, parse_a25, query_net_position_corrected
+Everything else replicates 0.8.1 value-for-value; these are the intentional
+differences (all verified against the live platform):
 
-raw = get_client("raw")
+1. **365-day year blocks** — the library's calendar-year stepping reaches 366
+   days across a leap year, which the platform rejects with HTTP 400 (measured);
+   this client steps 365 days.
+2. **Block-first instant kept** — the library's `@year_limited` left-open
+   truncation silently drops the first instant of every non-first block; here
+   duplicates at block boundaries are collapsed by dedupe keep-last (identical
+   values, lossless).
+3. **`procured_capacity` returns a long table** `[timestamp, direction, mrid,
+   price, volume]` (the library's 3-level MultiIndex concatenates days with NaN
+   misalignment).
+4. **`load` / `load_forecast` / `generation_forecast` always return a Series**
+   (removes the dual-shape behaviour for callers).
+5. **`offered_capacity` takes `contract=`** (was `contract_marketagreement_type`).
+6. **Month-block chunking follows 0.8.1 `@month_limited`** (load / generation /
+   cross-border families ...). Two exceptions: `ntc_dayahead` is still
+   `@year_limited` in 0.8.1 while this client uses uniform month blocks
+   (fully equivalent for <= 1-month windows); `net_position` uses the 365-day
+   blocks from `query_net_position_corrected` (neither drops a block's first
+   instant — identical point set, different request granularity).
 
-# From raw XML (direction decided explicitly by in/out_Domain):
-series = parse_a25(xml_text, area_code="RO", tz="Europe/Bucharest")
+## Window handling (0.2.0)
 
-# Or end-to-end (fetch -> parse -> resample -> tz -> truncate):
-series = query_net_position_corrected(
-    raw, "RO",
-    start=pd.Timestamp("2026-09-15", tz="Europe/Bucharest"),
-    end=pd.Timestamp("2026-09-16", tz="Europe/Bucharest"),
-)
-```
+`EntsoeClient` caps long windows itself where the raw client has no `limited`
+decorator of its own:
 
-`query_net_position_corrected()` output is **value-identical** to
-`EntsoePandasClient.query_net_position` for the areas tested (RO); the only
-differences are the explicit domain-direction parsing and the `mean` (instead of
-`first`) hourly aggregation before the SDAC go-live.
+* `net_position()` splits windows at a measured **365-day** cap (binary-searched
+  against the live A25 endpoint: 365 d OK, 366 d HTTP 400 — the platform does
+  *not* enforce the one-month limit that 0.8.1's `@month_limited` anticipates).
+  Windows up to one year stay a **single call** (identical to 0.8.0 behaviour,
+  no extra quota); longer windows are fetched block by block (left-closed /
+  right-open), merged with `dedupe_by_index`, and the **first instant of every
+  block is kept**; `NoMatchingDataError` is raised only when *every* block is
+  empty.
+* A44 day-ahead prices keep the library's +-1 day outer padding and page with
+  `offset` steps of 100.
 
-**Window handling (0.2.0)**: `query_net_position_corrected()` fetches raw XML via
-`EntsoeRawClient`, which carries no `limited` decorator — the library never splits
-the window for you. Measured against the live A25 endpoint (binary search,
-2026-10-18), the platform's window cap is **365 days** (366 days → HTTP 400). The
-function therefore caps windows at 365 days itself:
+## Parsing caveats replicated on purpose
 
-* windows up to one year → a **single** request (identical to entsoe-py 0.8.0 behaviour, no extra quota);
-* longer windows → fetched block by block (≤365 d, left-closed/right-open), merged
-  with `dedupe_by_index`, and the **first instant of every block is kept** (the
-  0.8.0 `@year_limited` left-open truncation, which silently dropped it, is not
-  replicated). `NoMatchingDataError` is raised only when *every* block is empty.
-
-## Compatibility
-
-`entsoe-ext` wraps a couple of **private** helpers of `entsoe-py`
-(`entsoe.series_parsers._extract_timeseries`, `_parse_timeseries_generic`) and patches
-its internals, so it is validated against **`entsoe-py` 0.8.0 and 0.8.1**. `install()` is
-a no-op (with a warning) on any other version. If you upgrade `entsoe-py`, re-check this
-package — the upstream fixes may already be present, in which case the wrappers can be
-dropped.
-
-> 0.8.1 note: 0.8.1 only swaps several endpoint decorators from `@year_limited` to the
-> new `@month_limited` (its release notes cite an ENTSO-E platform-side change) and
-> rewrites `month_blocks`. Empirically the platform does **not** (yet) enforce a
-> one-month cap on A25 — the measured limit is 365 days — so `@month_limited` is a
-> defensive tightening; this package keeps the wider, measured 365-day cap and only
-> splits when a window exceeds it. The files that this package patches or reuses
-> (`parsers.py`, `series_parsers.py`) are **byte-identical** between 0.8.0 and 0.8.1,
-> and neither patched defect is fixed upstream, so the patches apply unchanged.
+* **A84** reads only the first `<Period>` of each `TimeSeries` (verbatim from the
+  library; multi-Period revision segments are truncated).
+* **A84 / A81 output is not deduplicated** — the source may return multiple
+  documents for the same key (original + revisions); consumers collapse
+  duplicates themselves (`drop_duplicates(keep="last")`).
+* **Outages** keep every document revision as a separate row (dedupe exempt,
+  like the library) and filter the window with an OR condition.
+* **A72 hydro** keeps the native index (no tz conversion, no truncation).
 
 ## Tests
 
@@ -138,8 +149,14 @@ dropped.
 python -m unittest discover -s tests -v
 ```
 
+The suite is fully offline (constructed XML/ZIP fixtures, fake transport
+sessions); it covers the parsers, the client's error mapping/retry/params
+casing, the 365-day window split and the A25 domain-direction parsing.
+
 ## License & attribution
 
-MIT — see [LICENSE](LICENSE). This project depends on and interoperates with
-[entsoe-py](https://github.com/EnergieID/entsoe-py) (MIT). All credits for the
-underlying Transparency Platform client go to the entsoe-py authors.
+MIT — see [LICENSE](LICENSE). The area/EIC mappings and the parsing semantics
+replicate [entsoe-py](https://github.com/EnergieID/entsoe-py) (MIT License,
+Copyright (c) EnergieID / entsoe-py contributors); all credits for the original
+Transparency Platform client design go to its authors. This package neither
+depends on nor patches entsoe-py at runtime.

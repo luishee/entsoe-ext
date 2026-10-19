@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "entsoe-ext"
-version = "0.1.0"
-description = "Opt-in fixes and explicit wrappers around entsoe-py 0.8.0 (unknown resolution, per_hour aggregation, net-position parsing, single client entry point)."
+version = "0.2.0"
+description = "Self-contained ENTSO-E Transparency Platform client: raw XML channels plus parsed Series/DataFrame methods, replicating entsoe-py 0.8.1 semantics with no entsoe-py runtime dependency."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
@@ -13,7 +13,6 @@ license-files = ["LICENSE"]
 authors = [{ name = "luishee" }]
 keywords = [
   "entsoe",
-  "entsoe-py",
   "transparency-platform",
   "energy",
   "net-position",
@@ -23,14 +22,10 @@ classifiers = [
   "Topic :: Scientific/Engineering",
 ]
 dependencies = [
-  # Pinned: this package intentionally wraps a couple of entsoe-py *private*
-  # helpers (`entsoe.series_parsers._extract_timeseries` /
-  # `_parse_timeseries_generic`) and patches its internals, so it is only
-  # validated against these exact versions (see ``install()`` version guard).
-  # 0.8.1 is byte-identical on the patched surface (parsers.py /
-  # series_parsers.py unchanged; entsoe.py only adds ``@month_limited``
-  # decorator swaps) and fixes none of the patched defects.
-  "entsoe-py>=0.8.0,<0.8.2",
+  # The HTTP layer uses requests; parsing is bs4 (html.parser) + pandas.
+  # entsoe-py is intentionally NOT a dependency (semantics are replicated).
+  "requests>=2.28",
+  "beautifulsoup4>=4.11",
   "pandas>=1.5",
 ]
 

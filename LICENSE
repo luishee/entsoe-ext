@@ -22,8 +22,8 @@ SOFTWARE.
 
 ---
 
-This project depends on and interoperates with
+This project replicates parts of the protocol/parsing semantics of
 [entsoe-py](https://github.com/EnergieID/entsoe-py) (MIT License,
-Copyright (c) EnergieID / entsoe-py contributors). It neither vendors nor
-modifies the installed entsoe-py distribution; it wraps and patches it at
-runtime. See README.md for details.
+Copyright (c) EnergieID / entsoe-py contributors) — notably the Area/EIC
+mappings and the document parsers. It does not depend on or patch the
+entsoe-py distribution at runtime. See README.md for details.
