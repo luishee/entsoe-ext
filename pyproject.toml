@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "entsoe-ext"
-version = "0.2.0"
+version = "0.2.1"
 description = "Self-contained ENTSO-E Transparency Platform client: raw XML channels plus parsed Series/DataFrame methods, replicating entsoe-py 0.8.1 semantics with no entsoe-py runtime dependency."
 readme = "README.md"
 requires-python = ">=3.9"

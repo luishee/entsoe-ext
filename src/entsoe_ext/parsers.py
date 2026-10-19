@@ -3,7 +3,7 @@
 entsoe-py 0.8.1 parsers.py that this project uses; value-equivalent — only two
 documented differences):
 
-- A81 ``parse_procured_capacity_long``: outputs a **long table**
+- A15 ``parse_procured_capacity_long``: outputs a **long table**
   [timestamp, direction, mrid, price, volume] (the library returns a 3-level
   MultiIndex (direction, mrid, unit) whose multi-day concat leaves NaN
   misalignment).
@@ -374,11 +374,11 @@ def parse_imbalance_volumes_zip(zip_contents: bytes,
 
 
 # ============================================================
-# A81 procured balancing capacity (ZIP) — long-table output (deliberate difference 3)
+# A15 procured balancing capacity (ZIP) — long-table output (deliberate difference 3)
 # ============================================================
 
 def parse_procured_capacity_long(zip_contents: bytes) -> pd.DataFrame:
-    """A15/A81 -> long-table DataFrame [timestamp, direction, mrid, price, volume].
+    """A15 -> long-table DataFrame [timestamp, direction, mrid, price, volume].
 
     direction: flowDirection A01 -> Up / A02 -> Down; mrid: int;
     price = procurement_price.amount, volume = quantity (each with A03 ffill

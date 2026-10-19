@@ -41,7 +41,7 @@ from entsoe_ext.series_ext import (  # noqa: F401
 # package from configuring the root logger; callers opt in to logging themselves.
 logging.getLogger("entsoe_ext").addHandler(logging.NullHandler())
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 __all__ = [
     "__version__",

@@ -31,6 +31,7 @@ cross-border family = the "from" area timezone; hydro = native index
 """
 import logging
 import os
+import re
 import socket
 import time
 from http.client import RemoteDisconnected
@@ -69,6 +70,36 @@ QUARTER_MTU_SDAC_GOLIVE = pd.Timestamp("2025-10-01", tz="Europe/Amsterdam")
 
 _AGGREGATED_BIDS_PROCESS_TYPES = {"A51", "A46", "A47", "A60", "A61", "A67", "A68"}
 _PROCURED_PROCESS_TYPES = {"A51", "A52", "A47"}
+
+# ============================================================
+# Security-token masking at the source (adopted from entsoe-py master
+# commit 411e4f7 — ahead of the 0.8.1 release this package replicates).
+#
+# requests raises HTTPError with the full request URL (including
+# securityToken=<plain key>) in its message. Masking at raise time keeps
+# the key out of tracebacks and log records, including paths that bypass
+# any logging-level scrubber.
+# ============================================================
+SECURITY_TOKEN_PATTERN = re.compile(r"(securityToken=)[^&\s'\"]+")
+
+
+def _mask_security_token(text: str) -> str:
+    """Replace the value of any securityToken parameter in a string with a
+    placeholder, so that API keys do not end up in logs or error messages."""
+    return SECURITY_TOKEN_PATTERN.sub(r"\1<hidden>", text)
+
+
+def _masked_http_error(error: requests.HTTPError) -> requests.HTTPError:
+    """Rebuild an HTTPError with the securityToken masked in its message.
+
+    The type, the response and the request are preserved, so that callers
+    catching requests.HTTPError and inspecting error.response keep working.
+    """
+    masked = requests.HTTPError(
+        _mask_security_token(str(error)), response=error.response)
+    if masked.request is None:
+        masked.request = error.request
+    return masked
 
 
 class EntsoeClient:
@@ -152,11 +183,11 @@ class EntsoeClient:
             if len(text):
                 error_text = soup.find("text").text
                 if "No matching data found" in error_text:
-                    raise NoMatchingDataError
+                    raise NoMatchingDataError from None
                 elif "check you request against dependency tables" in error_text:
-                    raise InvalidBusinessParameterError
+                    raise InvalidBusinessParameterError from None
                 elif "is not valid for this area" in error_text:
-                    raise InvalidPSRTypeError
+                    raise InvalidPSRTypeError from None
                 elif ("amount of requested data exceeds allowed limit"
                       in error_text):
                     requested = error_text.split(" ")[-2]
@@ -164,7 +195,7 @@ class EntsoeClient:
                     raise PaginationError(
                         f"The API is limited to {allowed} elements per "
                         f"request. This query requested for {requested} "
-                        f"documents and cannot be fulfilled as is.")
+                        f"documents and cannot be fulfilled as is.") from None
                 elif ("requested data to be gathered via the offset parameter "
                       "exceeds the allowed limit" in error_text):
                     requested = error_text.split(" ")[-9]
@@ -172,8 +203,12 @@ class EntsoeClient:
                     raise PaginationError(
                         f"The API is limited to {allowed} elements per "
                         f"request. This query requested for {requested} "
-                        f"documents and cannot be fulfilled as is.")
-            raise e
+                        f"documents and cannot be fulfilled as is.") from None
+            # Not one of the known error bodies: re-raise as is, but masked
+            # (the HTTPError message embeds the full request URL including
+            # securityToken=...); `from None` suppresses the exception chain,
+            # which would otherwise still hold the unmasked original.
+            raise _masked_http_error(e) from None
         else:
             # The platform sometimes answers 200 with no data for otherwise valid
             # parameters — matched by content text.
@@ -704,7 +739,7 @@ class EntsoeClient:
 
     def procured_capacity(self, country_code, process_type: str, start,
                           end) -> pd.DataFrame:
-        """A81 procured balancing capacity -> **long table**
+        """A15 procured balancing capacity -> **long table**
         [timestamp, direction, mrid, price, volume].
 
         Year blocks + paginate + offset=100 pagination (the library nests three

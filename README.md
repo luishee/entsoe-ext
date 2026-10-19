@@ -31,6 +31,27 @@ Requires Python >= 3.9; dependencies are `requests`, `beautifulsoup4` and
 export ENTSOE_API_KEY="your-token"   # PowerShell: $env:ENTSOE_API_KEY="..."
 ```
 
+## API access and documentation
+
+The Transparency Platform REST interface is token-based: every request carries
+a `securityToken` that ENTSO-E issues per account.
+
+1. Create an account on the [Transparency Platform](https://transparency.entsoe.eu/).
+2. From the email address used at registration, write to
+   `transparency@entsoe.eu` — subject `Restful API access`, and state that same
+   registered address in the body — to request API access.
+3. Once access is granted, generate your security token in the account
+   settings on the platform.
+4. Provide the token to this package via `get_client(api_key="...")`, or
+   export it as `ENTSOE_API_KEY` (see [Install](#install)).
+
+ENTSO-E is the association of Europe's electricity transmission system
+operators, and its Transparency Platform is the source of every dataset this
+client fetches. Reference material for the underlying REST interface:
+
+- Postman collection (endpoint reference): <https://documenter.getpostman.com/view/7009892/2s93JtP3F6>
+- Static Web API guide on the platform: <https://transparency.entsoe.eu/content/static_content/Static%20content/web%20api/Guide.html>
+
 ## Usage
 
 ### Single client entry point
@@ -64,7 +85,7 @@ xml = client.net_position_xml("RO", start, end)      # raw XML (audit / custom p
 | `imbalance_prices(a, s, e)` | A85 | DataFrame (Long/Short) | area.tz |
 | `imbalance_volumes(a, s, e)` | A86 | Series | area.tz |
 | `activated_balancing_prices(a, s, e)` | A84 | DataFrame (Price/Direction/ReserveType) | area.tz |
-| `procured_capacity(a, process_type, s, e)` | A81 | **long table** `[timestamp, direction, mrid, price, volume]` | area.tz |
+| `procured_capacity(a, process_type, s, e)` | A15 | **long table** `[timestamp, direction, mrid, price, volume]` | area.tz |
 | `hydro_reservoir_storage(a, s, e)` | A72 | Series | native (not converted) |
 | `crossborder_flows(f, t, s, e)` | A11 | Series | from-area tz |
 | `scheduled_exchanges(f, t, s, e)` | A09 | Series | from-area tz |
@@ -115,6 +136,13 @@ differences (all verified against the live platform):
    (fully equivalent for <= 1-month windows); `net_position` uses the 365-day
    blocks from `query_net_position_corrected` (neither drops a block's first
    instant — identical point set, different request granularity).
+7. **Security-token masking** — any re-raised `requests.HTTPError` is rebuilt
+   with the `securityToken` value replaced by `<hidden>`, and every mapped
+   error raises with `from None`, so the raw URL (which embeds the plain API
+   key) never reaches tracebacks, error messages or logs. Adopted from
+   entsoe-py master (commit `411e4f7`, ahead of the 0.8.1 release this
+   package replicates); the response and request objects are preserved on
+   the rebuilt error.
 
 ## Window handling (0.2.0)
 
@@ -136,7 +164,7 @@ decorator of its own:
 
 * **A84** reads only the first `<Period>` of each `TimeSeries` (verbatim from the
   library; multi-Period revision segments are truncated).
-* **A84 / A81 output is not deduplicated** — the source may return multiple
+* **A84 / A15 output is not deduplicated** — the source may return multiple
   documents for the same key (original + revisions); consumers collapse
   duplicates themselves (`drop_duplicates(keep="last")`).
 * **Outages** keep every document revision as a separate row (dedupe exempt,
@@ -152,6 +180,21 @@ python -m unittest discover -s tests -v
 The suite is fully offline (constructed XML/ZIP fixtures, fake transport
 sessions); it covers the parsers, the client's error mapping/retry/params
 casing, the 365-day window split and the A25 domain-direction parsing.
+
+## Changelog
+
+- **0.2.1** — Security hardening and documentation accuracy:
+  - Security-token masking at the error-raising source (adopted from
+    entsoe-py master `411e4f7`): re-raised `requests.HTTPError` messages no
+    longer embed the plain API key, and mapped errors raise with `from None`
+    so suppressed chains cannot leak it either. `error.response` /
+    `error.request` are preserved.
+  - Fixed the `procured_capacity` document-type label in docs/docstrings:
+    the endpoint queries **A15** (procured balancing capacity), not A81
+    (contracted reserves); the query itself was always correct.
+- **0.2.0** — Self-built client replacing the entsoe-py wrapper (see
+  the breaking-changes note at the top).
+- **0.1.x** — Wrapper/patch line around entsoe-py 0.8.1.
 
 ## License & attribution
 

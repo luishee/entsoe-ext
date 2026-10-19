@@ -20,15 +20,18 @@ from entsoe_ext.exceptions import (InvalidBusinessParameterError,
 
 class _Resp:
     def __init__(self, text="", content=b"", status=200,
-                 content_type="application/xml"):
+                 content_type="application/xml", url=""):
         self.text = text
         self.content = content
         self.status_code = status
         self.headers = {"content-type": content_type}
+        self.url = url
 
     def raise_for_status(self):
         if self.status_code >= 400:
-            raise requests.HTTPError(f"{self.status_code} Error", response=self)
+            raise requests.HTTPError(
+                f"{self.status_code} Client Error for url: {self.url}",
+                response=self)
 
 
 def _err_xml(msg):
@@ -121,6 +124,45 @@ class TestErrorMapping(unittest.TestCase):
         with self.assertRaises(NoMatchingDataError):
             c.net_position_xml("RO", pd.Timestamp("2025-10-01", tz="UTC"),
                                pd.Timestamp("2025-10-02", tz="UTC"))
+
+
+class TestSecurityTokenMasking(unittest.TestCase):
+    """A re-raised HTTPError must not embed the plain API key (masking
+    adopted from entsoe-py master 411e4f7), while the request itself still
+    carries the real token and error.response is preserved."""
+
+    SECRET = "super-secret-token-123"
+
+    def _client(self):
+        def responder(params):
+            # mimic requests: the error message contains the full request URL
+            qs = "&".join(f"{k}={v}" for k, v in params.items())
+            return _Resp("Unauthorized", status=401,
+                         content_type="text/html",
+                         url=f"https://web-api.tp.entsoe.eu/api?{qs}")
+
+        c = FakeClient(responder)
+        c.api_key = self.SECRET
+        return c
+
+    def test_masked_message_and_preserved_response(self):
+        c = self._client()
+        with self.assertRaises(requests.HTTPError) as cm:
+            c.net_position_xml("RO", pd.Timestamp("2025-10-01", tz="UTC"),
+                               pd.Timestamp("2025-10-02", tz="UTC"))
+        err = cm.exception
+        self.assertNotIn(self.SECRET, str(err))
+        self.assertIn("securityToken=<hidden>", str(err))
+        self.assertEqual(err.response.status_code, 401)
+        # `from None` suppresses the chain that holds the unmasked original
+        self.assertIsNone(err.__cause__)
+
+    def test_real_token_still_reaches_request(self):
+        c = self._client()
+        with self.assertRaises(requests.HTTPError):
+            c.net_position_xml("RO", pd.Timestamp("2025-10-01", tz="UTC"),
+                               pd.Timestamp("2025-10-02", tz="UTC"))
+        self.assertEqual(c.calls[0][1]["securityToken"], self.SECRET)
 
 
 class TestRetry(unittest.TestCase):
