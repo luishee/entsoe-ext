@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Series-level corrections for entsoe-py 0.8.0 (resolution / resample / dedupe).
+"""Series-level corrections for entsoe-py 0.8.0/0.8.1 (resolution / resample / dedupe).
+
+(Historical module: the client itself is now self-built; this module remains as
+entsoe_ext's series utility layer, used by ``client.py`` / ``a25.py``. The
+defect descriptions below refer to entsoe-py 0.8.0 / 0.8.1.)
 
 Corresponds to three "uncertain declaration / TODO" spots of entsoe-py 0.8.0:
 
@@ -101,9 +105,8 @@ def to_hourly_mean(obj):
 
 
 def sdac_golive():
-    """SDAC 15-min MTU go-live timestamp (taken from the library constant)."""
-    from entsoe.entsoe import QUARTER_MTU_SDAC_GOLIVE
-    return QUARTER_MTU_SDAC_GOLIVE
+    """SDAC 15-min MTU go-live timestamp (local constant, same value as entsoe-py)."""
+    return pd.Timestamp("2025-10-01", tz="Europe/Amsterdam")
 
 
 def resample_sdac_native(series, golive=None):

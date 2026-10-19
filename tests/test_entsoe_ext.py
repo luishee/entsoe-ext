@@ -1,14 +1,17 @@
 # -*- coding: utf-8 -*-
-"""Unit tests for entsoe-ext.
+"""Unit tests for entsoe-ext (self-built client).
 
 Coverage:
-- A25 parsing: out=own→positive / in=own→negative, non-own domain excluded
-  (incl. ``strict_other``), seam duplicate timestamps ``keep='last'``, tz conversion;
-- ``resample_sdac_native``: multiple native MTUs before go-live → mean (not first),
-  native resolution kept after go-live;
-- ``resolution_to_timedelta_ext``: known set + generic ISO-8601 fallback + ValueError;
-- ``dedupe_by_index`` / ``to_hourly_mean``;
-- ``patch.install()`` idempotency and effectiveness.
+- A25 self-parsing (parse_a25): RO_OUT / RO_IN domain direction, non-own
+  domain exclusion (incl. strict_other), seam duplicate timestamps keep='last',
+  tz conversion;
+- EntsoeClient.net_position 365-day window chunking (absorbed from
+  query_net_position_corrected: <=1 year single call, block-first instant kept,
+  all-empty raises);
+- resample_sdac_native: multiple pre-golive MTUs -> mean (not first), native
+  resolution kept after go-live;
+- resolution_to_timedelta_ext: known set + generic ISO-8601 fallback + ValueError;
+- dedupe_by_index / to_hourly_mean.
 
 Run: python -m unittest discover -s tests -v
 """
@@ -16,14 +19,16 @@ import unittest
 
 import pandas as pd
 
-from entsoe.mappings import lookup_area
 from entsoe_ext import (
+    EntsoeClient,
+    NoMatchingDataError,
     dedupe_by_index,
     parse_a25,
     resolution_to_timedelta_ext,
     resample_sdac_native,
     to_hourly_mean,
 )
+from entsoe_ext.mappings import lookup_area
 
 RO_EIC = lookup_area("RO").code
 NEIGH_EIC = "10YHU-TSO-----2"     # neighbour (not RO)
@@ -61,10 +66,10 @@ def _doc(*blocks):
 
 
 class TestParseA25(unittest.TestCase):
-    """A25 parsing: direction decided explicitly by in/out domain (native sign kept)."""
+    """A25 self-parsing: direction from in/out domain (native sign kept)."""
 
     def test_out_domain_is_positive_in_is_negative(self):
-        # out=RO → export (positive); in=RO → import (negative); non-overlapping
+        # out=RO -> export (positive); in=RO -> import (negative); disjoint windows
         xml = _doc(
             _ts_xml(NEIGH_EIC, RO_EIC, "2025-10-01T00:00Z", "PT15M", [100, 200]),
             _ts_xml(RO_EIC, NEIGH_EIC, "2025-10-01T00:30Z", "PT15M", [300]),
@@ -78,7 +83,7 @@ class TestParseA25(unittest.TestCase):
         self.assertEqual(str(s.index.tz), "UTC")
 
     def test_non_national_domain_excluded(self):
-        # the only TimeSeries has neither side == RO → excluded → empty Series
+        # the only TimeSeries has neither side == RO -> excluded -> empty Series
         xml = _doc(_ts_xml(NEIGH_EIC, OTHER_EIC, "2025-10-01T00:00Z", "PT15M", [50]))
         s = parse_a25(xml, "RO")
         self.assertEqual(len(s), 0)
@@ -89,7 +94,7 @@ class TestParseA25(unittest.TestCase):
             parse_a25(xml, "RO", strict_other=True)
 
     def test_seam_duplicate_keeps_last(self):
-        # two RO-export TimeSeries overlap at 00:00 → keep='last' wins
+        # two RO-export TimeSeries overlap at 00:00 -> keep='last' wins
         xml = _doc(
             _ts_xml(NEIGH_EIC, RO_EIC, "2025-10-01T00:00Z", "PT15M", [111, 222]),
             _ts_xml(NEIGH_EIC, RO_EIC, "2025-10-01T00:00Z", "PT15M", [999]),
@@ -104,12 +109,124 @@ class TestParseA25(unittest.TestCase):
         xml = _doc(_ts_xml(NEIGH_EIC, RO_EIC, "2025-10-01T00:00Z", "PT15M", [100]))
         s = parse_a25(xml, "RO", tz="Europe/Bucharest")
         self.assertEqual(str(s.index.tz), "Europe/Bucharest")
-        # 2025-10-01 Romania is EEST (UTC+3) → 00:00Z = 03:00 local
+        # 2025-10-01 Romania is EEST (UTC+3) -> 00:00Z = 03:00 local
         self.assertIn(pd.Timestamp("2025-10-01T03:00:00+03:00"), s.index)
 
 
+class _FakeSession:
+    def __init__(self, responder):
+        self.responder = responder
+        self.calls = []
+        self.headers = {}
+
+    def get(self, url, params=None, proxies=None, timeout=None):
+        self.calls.append((url, dict(params or {})))
+        return self.responder(dict(params or {}))
+
+
+class _Resp:
+    def __init__(self, text):
+        self.text = text
+        self.status_code = 200
+        self.headers = {"content-type": "application/xml"}
+
+    def raise_for_status(self):
+        pass
+
+
+class TestNetPositionWindowSplit(unittest.TestCase):
+    """EntsoeClient.net_position 365-day window split (measured platform cap).
+
+    A fake session (transport layer) records periodStart / periodEnd per
+    request, verifying:
+    - windows <= 1 year stay a single call (no extra quota);
+    - longer windows split by 365-day steps (left-closed/right-open blocks,
+      adjacent blocks sharing their boundary instant);
+    - the block-first instant (00:00 of each block) is not dropped (no
+      @year_limited left-open truncation);
+    - a block raising NoMatchingDataError is skipped; only all-empty blocks
+      raise.
+    """
+
+    class _FakeClient(EntsoeClient):
+        def __init__(self, data_by_block_start=None):
+            self.api_key = "test"
+            self.proxies = None
+            self.timeout = 1
+            self.retry_count = 1
+            self.retry_delay = 0
+            self.data_by_block_start = data_by_block_start or {}
+            self.session = _FakeSession(self._respond)
+
+        def _respond(self, params):
+            start = pd.Timestamp(params["periodStart"], tz="UTC")
+            data = self.data_by_block_start.get(start)
+            if data is None:
+                from entsoe_ext.exceptions import NoMatchingDataError
+                raise NoMatchingDataError
+            vals_start, values = data
+            return _Resp(_doc(_ts_xml(NEIGH_EIC, RO_EIC, vals_start, "PT60M", values)))
+
+        @property
+        def calls(self):
+            return [(pd.Timestamp(p["periodStart"], tz="UTC"),
+                     pd.Timestamp(p["periodEnd"], tz="UTC"))
+                    for _, p in self.session.calls]
+
+    def test_window_within_a_year_single_call(self):
+        # a 3-month window (the ETL batch size) -> single call
+        s = pd.Timestamp("2025-06-01", tz="Europe/Bucharest")
+        e = pd.Timestamp("2025-09-01", tz="Europe/Bucharest")
+        client = self._FakeClient(data_by_block_start={
+            s.tz_convert("UTC"): ("2025-06-01T00:00Z", [100]),
+        })
+        out = client.net_position("RO", start=s, end=e)
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(len(out), 1)
+
+    def test_window_over_a_year_split_into_365d_blocks(self):
+        s = pd.Timestamp("2024-01-01", tz="Europe/Bucharest")
+        e = pd.Timestamp("2026-01-01", tz="Europe/Bucharest")   # 731 days -> 3 blocks
+        client = self._FakeClient()
+        with self.assertRaises(Exception):
+            client.net_position("RO", start=s, end=e)
+        self.assertEqual(len(client.calls), 3)
+        self.assertEqual(client.calls[0][0], s.tz_convert("UTC"))
+        self.assertEqual(client.calls[-1][1], e.tz_convert("UTC"))
+        for i in range(2):
+            self.assertEqual(client.calls[i][1], client.calls[i + 1][0])
+        # every block spans at most 365 days
+        for bs, be in client.calls:
+            self.assertLessEqual((be - bs).days, 365)
+
+    def test_block_first_instant_not_dropped(self):
+        # both blocks have data -> block 2's first instant must survive
+        s = pd.Timestamp("2024-06-01", tz="Europe/Bucharest")
+        b2 = s + pd.Timedelta(days=365)          # block boundary
+        e = pd.Timestamp("2025-09-01", tz="Europe/Bucharest")
+        client = self._FakeClient(data_by_block_start={
+            s.tz_convert("UTC"): ("2024-06-01T00:00Z", [100, 110]),
+            b2.tz_convert("UTC"): ("2025-05-31T00:00Z", [200, 210]),
+        })
+        out = client.net_position("RO", start=s, end=e)
+        self.assertEqual(len(client.calls), 2)
+        idx = {t.isoformat() for t in out.index}
+        # block 2 first instant: 2025-05-31 00:00Z = 03:00 EEST
+        self.assertIn("2025-05-31T03:00:00+03:00", idx)
+        self.assertIn("2025-05-31T04:00:00+03:00", idx)
+        self.assertIn("2024-06-01T03:00:00+03:00", idx)
+
+    def test_all_blocks_empty_raises(self):
+        s = pd.Timestamp("2024-01-01", tz="Europe/Bucharest")
+        e = pd.Timestamp("2026-01-01", tz="Europe/Bucharest")
+        client = self._FakeClient()   # every block raises NoMatchingDataError
+        with self.assertRaises(NoMatchingDataError):
+            client.net_position("RO", start=s, end=e)
+        self.assertEqual(len(client.calls), 3)
+
+
 class TestResampleSdacNative(unittest.TestCase):
-    """Before go-live → mean (not the library's first); after → keep native."""
+    """Pre-golive mean (not the library's first); post-golive keeps native."""
 
     def _series(self, times, vals):
         idx = pd.DatetimeIndex([pd.Timestamp(t).tz_localize("Europe/Amsterdam")
@@ -118,7 +235,7 @@ class TestResampleSdacNative(unittest.TestCase):
         return pd.Series([float(v) for v in vals], index=idx)
 
     def test_before_golive_multi_mtu_takes_mean_not_first(self):
-        # 3 native MTUs in one hour: 2,2,3 → mean=7/3≈2.333 (first would be 2)
+        # 3 native MTUs in one hour: 2,2,3 -> mean=7/3~2.333 (first would be 2)
         s = self._series(["2025-09-30T10:00", "2025-09-30T10:20", "2025-09-30T10:40"],
                          [2, 2, 3])
         out = resample_sdac_native(s, golive=GOLIVE)
@@ -172,120 +289,6 @@ class TestMiscHelpers(unittest.TestCase):
         out = to_hourly_mean(df)
         self.assertEqual(len(out), 1)
         self.assertAlmostEqual(float(out.iloc[0]["v"]), 2.0)
-
-
-class TestQueryNetPositionCorrectedWindowSplit(unittest.TestCase):
-    """Window splitting of ``query_net_position_corrected`` (measured platform cap 365 d).
-
-    RawClient carries no ``limited`` decorator → the function splits at 365 days
-    itself. A fake client records every ``(start, end)`` call, verifying:
-    - windows up to one year stay a single call (identical to 0.8.0 behaviour);
-    - longer windows are split into ≤365-day left-closed/right-open blocks whose
-      boundaries chain (each block's end == next block's start);
-    - the first instant of every block is kept (no ``@year_limited`` left-open
-      truncation);
-    - ``NoMatchingDataError`` from some blocks skips them; raised only when all
-      blocks are empty.
-    """
-
-    class _FakeClient:
-        """Stand-in raw client: intercept ``_base_request`` to return canned XML.
-
-        ``EntsoeRawClient.query_net_position(client, ...)`` only depends on
-        ``self._base_request(params, start, end)`` → intercepting there avoids
-        any network access.
-        """
-
-        def __init__(self, data_by_block=None):
-            self.calls = []                     # [(start, end), ...]
-            self.data_by_block = data_by_block or {}
-            self._last = None                   # most recent (start, end)
-
-        class _Resp:
-            def __init__(self, text):
-                self.text = text
-
-        def _base_request(self, params, start, end):
-            from entsoe.exceptions import NoMatchingDataError
-            self.calls.append((start, end))
-            self._last = (start, end)
-            for (bs, be), (vals_start, values) in self.data_by_block.items():
-                if start == bs and end == be:
-                    xml = _doc(_ts_xml(NEIGH_EIC, RO_EIC, vals_start, "PT60M", values))
-                    return self._Resp(xml)
-            raise NoMatchingDataError
-
-    def test_window_within_a_year_single_call(self):
-        # a 3-month window (the ETL batch size) → single call, same as 0.8.0
-        from entsoe_ext import query_net_position_corrected
-        s = pd.Timestamp("2025-06-01", tz="Europe/Bucharest")
-        e = pd.Timestamp("2025-09-01", tz="Europe/Bucharest")
-        client = self._FakeClient(data_by_block={
-            (s, e): ("2025-06-01T00:00Z", [100]),
-        })
-        out = query_net_position_corrected(client, "RO", start=s, end=e)
-        self.assertEqual(len(client.calls), 1)
-        self.assertEqual((client.calls[0][0], client.calls[0][1]), (s, e))
-        self.assertEqual(len(out), 1)
-
-    def test_window_over_a_year_split_into_365d_blocks(self):
-        from entsoe_ext import query_net_position_corrected
-        s = pd.Timestamp("2024-01-01", tz="Europe/Bucharest")
-        e = pd.Timestamp("2026-01-01", tz="Europe/Bucharest")   # 731 days → 3 blocks
-        client = self._FakeClient()
-        with self.assertRaises(Exception):
-            query_net_position_corrected(client, "RO", start=s, end=e)
-        self.assertEqual(len(client.calls), 3)
-        self.assertEqual(client.calls[0][0], s)
-        self.assertEqual(client.calls[-1][1], e)
-        for i in range(2):
-            self.assertEqual(client.calls[i][1], client.calls[i + 1][0])
-        # every block spans at most 365 days
-        for bs, be in client.calls:
-            self.assertLessEqual((be - bs).days, 365)
-
-    def test_block_first_instant_not_dropped(self):
-        # both blocks have data → the second block's first instant must survive
-        from entsoe_ext import query_net_position_corrected
-        s = pd.Timestamp("2024-06-01", tz="Europe/Bucharest")
-        b2 = s + pd.Timedelta(days=365)          # block boundary
-        e = pd.Timestamp("2025-09-01", tz="Europe/Bucharest")
-        client = self._FakeClient(data_by_block={
-            (s, b2): ("2024-06-01T00:00Z", [100, 110]),
-            (b2, e): ("2025-05-31T00:00Z", [200, 210]),
-        })
-        out = query_net_position_corrected(client, "RO", start=s, end=e)
-        self.assertEqual(len(client.calls), 2)
-        idx = {t.isoformat() for t in out.index}
-        # second block first instants: 2025-05-31 00:00Z = 03:00 EEST
-        self.assertIn("2025-05-31T03:00:00+03:00", idx)
-        self.assertIn("2025-05-31T04:00:00+03:00", idx)
-        self.assertIn("2024-06-01T03:00:00+03:00", idx)
-
-    def test_all_blocks_empty_raises(self):
-        from entsoe.exceptions import NoMatchingDataError
-        from entsoe_ext import query_net_position_corrected
-        s = pd.Timestamp("2024-01-01", tz="Europe/Bucharest")
-        e = pd.Timestamp("2026-01-01", tz="Europe/Bucharest")
-        client = self._FakeClient()   # every block raises NoMatchingDataError
-        with self.assertRaises(NoMatchingDataError):
-            query_net_position_corrected(client, "RO", start=s, end=e)
-        self.assertEqual(len(client.calls), 3)
-
-
-class TestPatchInstall(unittest.TestCase):
-    def test_install_idempotent_and_effective(self):
-        import entsoe
-        from entsoe_ext.patch import install
-        import entsoe.series_parsers as SP
-
-        if getattr(entsoe, "__version__", None) not in ("0.8.0", "0.8.1"):
-            self.skipTest(f"entsoe-py version {entsoe.__version__!r} not validated, "
-                          f"skipping patch assertions")
-        self.assertTrue(install())
-        self.assertTrue(getattr(SP, "_ENTS_EXT_PATCHED", False))
-        # unknown resolution no longer raises NotImplementedError → ISO fallback
-        self.assertEqual(SP._resolution_to_timedelta("PT45M"), "45min")
 
 
 if __name__ == "__main__":
